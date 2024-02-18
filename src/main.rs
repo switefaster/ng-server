@@ -15,7 +15,7 @@ use tokio::{
     task::JoinHandle,
     time::sleep,
 };
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::{IntervalStream, UnboundedReceiverStream};
 use tokio_tungstenite::{
     accept_async,
     tungstenite::{self, Message},
@@ -164,6 +164,10 @@ async fn process_message(
                                             game_lock.ready_players.remove(name);
 
                                             let timer_game = session_game.clone();
+                                            info!("Timer reset");
+                                            if let Some(ref timer_handle) = &timer_handle {
+                                                timer_handle.abort();
+                                            }
                                             *timer_handle = Some(tokio::spawn(async move {
                                                 sleep(TIMEOUT_DURATION).await;
                                                 let mut game_lock = timer_game.lock().unwrap();
@@ -230,7 +234,7 @@ async fn process_message(
                                                 }
 
                                                 game_lock.renew_inherit_clients();
-                                                if let Some(timer_handle) = timer_handle {
+                                                if let Some(timer_handle) = timer_handle.take() {
                                                     timer_handle.abort();
                                                 }
                                             }
@@ -276,6 +280,10 @@ async fn process_message(
                                         }
 
                                         let timer_game = session_game.clone();
+                                        info!("Timer reset");
+                                        if let Some(ref timer_handle) = &timer_handle {
+                                            timer_handle.abort();
+                                        }
                                         *timer_handle = Some(tokio::spawn(async move {
                                             sleep(TIMEOUT_DURATION).await;
                                             let mut game_lock = timer_game.lock().unwrap();
@@ -311,7 +319,7 @@ async fn process_message(
                                             }
 
                                             game_lock.renew_inherit_clients();
-                                            if let Some(ref timer_handle) = &timer_handle {
+                                            if let Some(ref timer_handle) = timer_handle.take() {
                                                 timer_handle.abort();
                                             }
                                         }
@@ -393,7 +401,7 @@ async fn process_message(
                                                 }
 
                                                 game_lock.renew_inherit_clients();
-                                                if let Some(timer_handle) = &timer_handle {
+                                                if let Some(timer_handle) = timer_handle.take() {
                                                     timer_handle.abort();
                                                 }
                                             } else {
@@ -572,6 +580,12 @@ async fn process_message(
                                                         game_lock.state =
                                                             protocol::GameState::Fighting;
                                                         let timer_game = session_game.clone();
+                                                        info!("Timer reset");
+                                                        if let Some(ref timer_handle) =
+                                                            &timer_handle
+                                                        {
+                                                            timer_handle.abort();
+                                                        }
                                                         *timer_handle = Some(tokio::spawn(
                                                             async move {
                                                                 sleep(TIMEOUT_DURATION).await;
@@ -664,6 +678,8 @@ async fn main() {
                 UnboundedReceiverStream::new(response_receiver).fuse();
             let mut timer_handle = None;
             let mut session_name = None;
+            let mut heartbeat_interval =
+                IntervalStream::new(tokio::time::interval(Duration::from_secs(1))).fuse();
             loop {
                 select! {
                     message = action_receiver_stream.select_next_some() => {
@@ -673,6 +689,12 @@ async fn main() {
                     }
                     response = response_receiver_stream.select_next_some() => {
                         match write.send(protocol_to_websocket_message(response)).await {
+                            Ok(_) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                    _ = heartbeat_interval.select_next_some() => {
+                        match write.send(Message::Ping(vec![])).await {
                             Ok(_) => continue,
                             Err(_) => break,
                         }
@@ -688,6 +710,36 @@ async fn main() {
                 if let Some(ref mut voting_session) = game_lock.voting_session {
                     voting_session.agreed.remove(&name);
                     voting_session.objection.remove(&name);
+                    let agree_count = voting_session.agreed.len();
+                    let objection_count = voting_session.objection.len();
+
+                    let player_count = game_lock
+                        .client_states
+                        .values()
+                        .filter(|cs| cs.is_player())
+                        .count();
+
+                    if player_count == agree_count + objection_count {
+                        if agree_count > objection_count {
+                            for client in game_lock.connections.values() {
+                                client
+                                    .send(protocol::Response::VoteAbortResult { abort: true })
+                                    .unwrap();
+                            }
+
+                            game_lock.renew_inherit_clients();
+                            if let Some(timer_handle) = timer_handle.take() {
+                                timer_handle.abort();
+                            }
+                        } else {
+                            for client in game_lock.connections.values() {
+                                client
+                                    .send(protocol::Response::VoteAbortResult { abort: false })
+                                    .unwrap();
+                            }
+                            game_lock.voting_session = None;
+                        }
+                    }
                 }
                 if game_lock.state == protocol::GameState::Fighting {
                     if let protocol::ClientState::Player(protocol::PlayerState::Alive, Some(_)) =
